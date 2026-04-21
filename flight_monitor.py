@@ -4,8 +4,248 @@ import pandas as pd
 from datetime import datetime
 import time
 import json
+import threading
+import random
+import math
 
-from modules.heartbeat import UAVSimulator, GroundStation
+class HeartbeatPacket:
+    def __init__(self, seq, timestamp, battery, altitude, speed, pitch, roll, yaw, latitude, longitude):
+        self.seq = seq
+        self.timestamp = timestamp
+        self.battery = battery
+        self.altitude = altitude
+        self.speed = speed
+        self.pitch = pitch
+        self.roll = roll
+        self.yaw = yaw
+        self.latitude = latitude
+        self.longitude = longitude
+
+class Waypoint:
+    def __init__(self, lat, lng, altitude=100.0, speed=15.0):
+        self.lat = lat
+        self.lng = lng
+        self.altitude = altitude
+        self.speed = speed
+
+class UAVSimulator:
+    def __init__(self, interval=1.0, offline_threshold=3.0):
+        self.interval = interval
+        self.offline_threshold = offline_threshold
+        self.sequence = 0
+        self.is_running = False
+        self.heartbeat_history = []
+        self.last_heartbeat_time = None
+        self._thread = None
+        self._lock = threading.Lock()
+        self.base_lat = 32.234104
+        self.base_lon = 118.749421
+        self.waypoints = []
+        self.current_waypoint_index = 0
+        self.progress_to_next_waypoint = 0.0
+        self.flying_route = False
+        self._generate_default_route()
+    
+    def _generate_default_route(self):
+        self.waypoints = [
+            Waypoint(32.234104, 118.749421, 100.0),
+            Waypoint(32.234500, 118.750000, 100.0),
+            Waypoint(32.235000, 118.749800, 120.0),
+            Waypoint(32.235200, 118.749000, 120.0),
+            Waypoint(32.234800, 118.748500, 100.0),
+            Waypoint(32.234300, 118.748800, 100.0),
+            Waypoint(32.234104, 118.749421, 100.0),
+        ]
+    
+    def set_circular_route(self, center_lat, center_lng, radius_km, num_points=8):
+        waypoints = []
+        for i in range(num_points):
+            angle = (i / num_points) * 2 * math.pi
+            dx = radius_km * math.cos(angle) / 111.0
+            dy = radius_km * math.sin(angle) / 111.0
+            waypoints.append(Waypoint(center_lat + dx, center_lng + dy))
+        waypoints.append(waypoints[0])
+        self.waypoints = waypoints
+        self.current_waypoint_index = 0
+        self.progress_to_next_waypoint = 0.0
+        self.flying_route = True
+    
+    def set_rectangular_route(self, start_lat, start_lng, width_km, height_km):
+        waypoints = [
+            Waypoint(start_lat, start_lng),
+            Waypoint(start_lat, start_lng + width_km / 111.0),
+            Waypoint(start_lat + height_km / 111.0, start_lng + width_km / 111.0),
+            Waypoint(start_lat + height_km / 111.0, start_lng),
+            Waypoint(start_lat, start_lng),
+        ]
+        self.waypoints = waypoints
+        self.current_waypoint_index = 0
+        self.progress_to_next_waypoint = 0.0
+        self.flying_route = True
+    
+    def _get_current_position(self):
+        if not self.flying_route or len(self.waypoints) < 2:
+            return (self.base_lat + random.uniform(-0.001, 0.001),
+                    self.base_lon + random.uniform(-0.001, 0.001),
+                    100 + random.uniform(-10, 10),
+                    15 + random.uniform(-3, 3))
+        
+        if self.current_waypoint_index >= len(self.waypoints) - 1:
+            self.current_waypoint_index = 0
+            self.progress_to_next_waypoint = 0.0
+        
+        current_wp = self.waypoints[self.current_waypoint_index]
+        next_wp = self.waypoints[self.current_waypoint_index + 1]
+        
+        lat = current_wp.lat + (next_wp.lat - current_wp.lat) * self.progress_to_next_waypoint
+        lng = current_wp.lng + (next_wp.lng - current_wp.lng) * self.progress_to_next_waypoint
+        alt = current_wp.altitude + (next_wp.altitude - current_wp.altitude) * self.progress_to_next_waypoint
+        spd = current_wp.speed + (next_wp.speed - current_wp.speed) * self.progress_to_next_waypoint
+        
+        self.progress_to_next_waypoint += 0.02
+        
+        if self.progress_to_next_waypoint >= 1.0:
+            self.progress_to_next_waypoint = 0.0
+            self.current_waypoint_index += 1
+        
+        noise = 0.00005
+        return (
+            lat + random.uniform(-noise, noise),
+            lng + random.uniform(-noise, noise),
+            alt + random.uniform(-2, 2),
+            spd + random.uniform(-1, 1)
+        )
+    
+    def _calculate_yaw(self, lat1, lng1, lat2, lng2):
+        d_lng = lng2 - lng1
+        yaw = math.atan2(d_lng, lat2 - lat1) * 180 / math.pi
+        return (yaw + 360) % 360
+    
+    def _generate_packet(self):
+        self.sequence += 1
+        lat, lng, alt, spd = self._get_current_position()
+        
+        if self.flying_route and len(self.waypoints) > 1:
+            if self.current_waypoint_index < len(self.waypoints) - 1:
+                next_wp = self.waypoints[self.current_waypoint_index + 1]
+                yaw = self._calculate_yaw(lat, lng, next_wp.lat, next_wp.lng)
+            else:
+                yaw = random.uniform(0, 360)
+        else:
+            yaw = random.uniform(0, 360)
+        
+        return HeartbeatPacket(
+            seq=self.sequence,
+            timestamp=datetime.now(),
+            battery=max(20, 100 - self.sequence * 0.02 + random.uniform(-0.5, 0.5)),
+            altitude=max(50, alt),
+            speed=max(5, spd),
+            pitch=random.uniform(-2, 2),
+            roll=random.uniform(-2, 2),
+            yaw=yaw,
+            latitude=lat,
+            longitude=lng
+        )
+    
+    def _simulate(self):
+        while self.is_running:
+            packet = self._generate_packet()
+            with self._lock:
+                self.heartbeat_history.append(packet)
+                self.last_heartbeat_time = packet.timestamp
+                if len(self.heartbeat_history) > 1000:
+                    self.heartbeat_history = self.heartbeat_history[-500:]
+            time.sleep(self.interval)
+    
+    def start(self):
+        if not self.is_running:
+            self.is_running = True
+            self._thread = threading.Thread(target=self._simulate, daemon=True)
+            self._thread.start()
+    
+    def stop(self):
+        self.is_running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+    
+    def check_offline(self):
+        if self.last_heartbeat_time is None:
+            return True
+        elapsed = (datetime.now() - self.last_heartbeat_time).total_seconds()
+        return elapsed > self.offline_threshold
+    
+    def get_offline_duration(self):
+        if self.last_heartbeat_time is None:
+            return 0.0
+        return (datetime.now() - self.last_heartbeat_time).total_seconds()
+    
+    def get_history_dataframe(self, last_n=100):
+        with self._lock:
+            if not self.heartbeat_history:
+                return pd.DataFrame()
+            data = self.heartbeat_history[-last_n:]
+            return pd.DataFrame([{
+                '序号': p.seq,
+                '时间': p.timestamp.strftime('%H:%M:%S'),
+                '电量': round(p.battery, 1),
+                '高度': round(p.altitude, 1),
+                '速度': round(p.speed, 1),
+                '俯仰角': round(p.pitch, 2),
+                '横滚角': round(p.roll, 2),
+                '偏航角': round(p.yaw, 2),
+                '纬度': round(p.latitude, 6),
+                '经度': round(p.longitude, 6)
+            } for p in data])
+    
+    def get_latest_packet(self):
+        with self._lock:
+            if self.heartbeat_history:
+                return self.heartbeat_history[-1]
+        return None
+    
+    def get_status_log(self, last_n=50):
+        with self._lock:
+            if not self.heartbeat_history:
+                return []
+            data = self.heartbeat_history[-last_n:]
+            logs = []
+            for p in data:
+                status = "正常" if p.battery > 30 else "低电量警告"
+                logs.append(f"[{p.timestamp.strftime('%H:%M:%S')}] 心跳#{p.seq} | 状态: {status} | 电量: {p.battery:.1f}% | 高度: {p.altitude:.1f}m")
+            return logs
+    
+    def get_route_waypoints(self):
+        return [(wp.lat, wp.lng) for wp in self.waypoints]
+
+class GroundStation:
+    def __init__(self, uav):
+        self.uav = uav
+        self.alert_history = []
+        
+    def monitor(self):
+        is_offline = self.uav.check_offline()
+        latest = self.uav.get_latest_packet()
+        
+        result = {
+            'status': '离线' if is_offline else '在线',
+            'is_offline': is_offline,
+            'offline_duration': self.uav.get_offline_duration() if is_offline else 0,
+            'latest_packet': latest,
+            'sequence': latest.seq if latest else 0,
+            'last_time': latest.timestamp if latest else None
+        }
+        
+        if is_offline:
+            alert_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 警告: 无人机已离线 {result['offline_duration']:.1f} 秒!"
+            self.alert_history.append(alert_msg)
+            if len(self.alert_history) > 100:
+                self.alert_history = self.alert_history[-50:]
+        
+        return result
+    
+    def get_alerts(self, last_n=20):
+        return self.alert_history[-last_n:]
 
 def render_flight_monitor_page():
     st.header("🚁 飞行监控")
@@ -114,13 +354,7 @@ def render_flight_monitor_page():
                         已离线 <span style="font-size: 24px; font-weight: bold;">{offline_duration:.1f}</span> 秒
                     </p>
                 </div>
-                <style>
-                    @keyframes pulse {{
-                        0% {{ opacity: 1; }}
-                        50% {{ opacity: 0.7; }}
-                        100% {{ opacity: 1; }}
-                    }}
-                </style>
+                <style>@keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} 100% {{ opacity: 1; }} }}</style>
                 """, unsafe_allow_html=True)
 
                 alerts = ground_station.get_alerts(last_n=5)
@@ -128,15 +362,15 @@ def render_flight_monitor_page():
                     st.markdown("**🔔 最新报警:**")
                     st.code(alerts[-1], language="log")
             else:
-                st.markdown("""
+                st.markdown(f"""
                 <div style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
                             padding: 20px; border-radius: 10px; text-align: center;">
                     <h2 style="color: white; margin: 0;">✅ 在线</h2>
                     <p style="color: white; font-size: 14px; margin: 8px 0 0 0;">
-                        心跳序号: <span style="font-size: 18px; font-weight: bold;">{}</span>
+                        心跳序号: <span style="font-size: 18px; font-weight: bold;">{status['sequence']}</span>
                     </p>
                 </div>
-                """.format(status['sequence']))
+                """, unsafe_allow_html=True)
 
             latest = status['latest_packet']
             if latest:
@@ -173,8 +407,6 @@ def render_flight_monitor_page():
             route_waypoints = uav.get_route_waypoints()
 
             if not df.empty and len(df) >= 2:
-                import streamlit.components.v1 as components
-
                 latest_lat = df['纬度'].iloc[-1]
                 latest_lon = df['经度'].iloc[-1]
                 center_lat = df['纬度'].mean()
@@ -183,75 +415,28 @@ def render_flight_monitor_page():
                 route_coords = [[row['纬度'], row['经度']] for _, row in df.iterrows()]
                 planned_route_coords = [[wp[0], wp[1]] for wp in route_waypoints]
 
-                map_html = f"""
+                map_html = """
                 <!DOCTYPE html>
                 <html>
                 <head>
                     <meta charset="utf-8">
                     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-                    <style>
-                        #map {{ width: 100%; height: 400px; margin: 0; }}
-                        .info-box {{
-                            position: absolute;
-                            top: 10px;
-                            left: 10px;
-                            background: white;
-                            padding: 10px 15px;
-                            border-radius: 8px;
-                            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                            z-index: 1000;
-                            font-size: 12px;
-                        }}
-                    </style>
+                    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+                    <style>#map { width: 100%; height: 400px; margin: 0; }</style>
                 </head>
                 <body>
                     <div id="map"></div>
-                    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
                     <script>
-                        var map = L.map('map').setView([{center_lat}, {center_lon}], 16);
-
-                        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                            attribution: '© OpenStreetMap',
-                            maxZoom: 19
-                        }}).addTo(map);
-
-                        {'L.polyline(' + json.dumps(planned_route_coords) + ', {color: "#FFA500", weight: 3, dashArray: "10, 5", opacity: 0.8}).addTo(map);' if planned_route_coords else ''}
-
-                        var routeLine = L.polyline({json.dumps(route_coords)}, {{
-                            color: '#3366FF',
-                            weight: 3,
-                            opacity: 0.7
-                        }}).addTo(map);
-
-                        var startMarker = L.circleMarker([{route_coords[0][0]}, {route_coords[0][1]}], {{
-                            radius: 8,
-                            color: '#28a745',
-                            fillColor: '#28a745',
-                            fillOpacity: 1
-                        }}).addTo(map);
-                        startMarker.bindPopup('<b style="color:green;">起点</b>');
-
-                        {'''
-                        for (var i = 0; i < ''' + str(len(planned_route_coords)) + '''; i++) {
-                            L.circleMarker(planned_route_coords[i], {
-                                radius: 6,
-                                color: "#FFA500",
-                                fillColor: "#FFA500",
-                                fillOpacity: 1
-                            }).addTo(map).bindPopup("航点 " + (i + 1));
-                        }
-                        ''' if planned_route_coords else ''}
-
-                        var endMarker = L.circleMarker([{latest_lat}, {latest_lon}], {{
-                            radius: 10,
-                            color: '#FF6B6B',
-                            fillColor: '#FF6B6B',
-                            fillOpacity: 1
-                        }}).addTo(map);
-                        endMarker.bindPopup('<b style="color:red;">当前位置</b><br>序号: ' + {status['sequence']} + '<br>速度: ' + {latest.speed:.1f} + 'm/s');
-
-                        var bounds = routeLine.getBounds();
-                        map.fitBounds(bounds, {{padding: [30, 30]}});
+                        var map = L.map('map').setView([""" + f"{center_lat}, {center_lon}" + """], 16);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '© OpenStreetMap', maxZoom: 19
+                        }).addTo(map);
+                        """ + ("L.polyline(" + json.dumps(planned_route_coords) + ", {color: '#FFA500', weight: 3, dashArray: '10, 5', opacity: 0.8}).addTo(map);" if planned_route_coords else "") + """
+                        var routeLine = L.polyline(""" + json.dumps(route_coords) + """, {color: '#3366FF', weight: 3, opacity: 0.7}).addTo(map);
+                        L.circleMarker(""" + json.dumps(route_coords[0]) + """, {radius: 8, color: '#28a745', fillColor: '#28a745', fillOpacity: 1}).addTo(map).bindPopup('<b style="color:green;">起点</b>');
+                        """ + ("""for(var i=0; i<""" + str(len(planned_route_coords)) + """;i++){L.circleMarker(planned_route_coords[i],{radius:6,color:"#FFA500",fillColor:"#FFA500",fillOpacity:1}).addTo(map).bindPopup("航点 "+(i+1));}""" if planned_route_coords else "") + """
+                        L.circleMarker([""" + f"{latest_lat}, {latest_lon}" + """], {radius: 10, color: '#FF6B6B', fillColor: '#FF6B6B', fillOpacity: 1}).addTo(map).bindPopup('<b style="color:red;">当前位置</b><br>序号: """ + str(status['sequence']) + """');
+                        map.fitBounds(routeLine.getBounds(), {padding: [20, 20]});
                     </script>
                 </body>
                 </html>
@@ -269,43 +454,21 @@ def render_flight_monitor_page():
             with col_chart1:
                 st.subheader("💓 心跳序号曲线")
                 fig_seq = go.Figure()
-                fig_seq.add_trace(go.Scatter(
-                    x=df['时间'],
-                    y=df['序号'],
-                    mode='lines+markers',
-                    name='心跳序号',
-                    line=dict(color='#00D4AA', width=2),
-                    marker=dict(size=5)
-                ))
-                fig_seq.update_layout(
-                    template='plotly_dark',
-                    height=300,
-                    hovermode='x unified',
-                    margin=dict(l=40, r=20, t=40, b=40)
-                )
+                fig_seq.add_trace(go.Scatter(x=df['时间'], y=df['序号'], mode='lines+markers',
+                                             name='心跳序号', line=dict(color='#00D4AA', width=2), marker=dict(size=5)))
+                fig_seq.update_layout(template='plotly_dark', height=300, hovermode='x unified',
+                                      margin=dict(l=40, r=20, t=40, b=40))
                 st.plotly_chart(fig_seq, use_container_width=True)
 
             with col_chart2:
                 st.subheader("🔋 电池电量曲线")
                 fig_battery = go.Figure()
-                fig_battery.add_trace(go.Scatter(
-                    x=df['时间'],
-                    y=df['电量'],
-                    mode='lines',
-                    name='电量',
-                    line=dict(color='#FF6B6B', width=2),
-                    fill='tozeroy',
-                    fillcolor='rgba(255, 107, 107, 0.2)'
-                ))
-                fig_battery.add_hline(y=30, line_dash="dash", line_color="red",
-                                     annotation_text="低电量警告")
-                fig_battery.update_layout(
-                    template='plotly_dark',
-                    height=300,
-                    yaxis=dict(range=[0, 105]),
-                    hovermode='x unified',
-                    margin=dict(l=40, r=20, t=40, b=40)
-                )
+                fig_battery.add_trace(go.Scatter(x=df['时间'], y=df['电量'], mode='lines',
+                                                 name='电量', line=dict(color='#FF6B6B', width=2),
+                                                 fill='tozeroy', fillcolor='rgba(255, 107, 107, 0.2)'))
+                fig_battery.add_hline(y=30, line_dash="dash", line_color="red", annotation_text="低电量警告")
+                fig_battery.update_layout(template='plotly_dark', height=300, yaxis=dict(range=[0, 105]),
+                                          hovermode='x unified', margin=dict(l=40, r=20, t=40, b=40))
                 st.plotly_chart(fig_battery, use_container_width=True)
 
             st.markdown("### 🎯 飞行姿态")
@@ -314,36 +477,21 @@ def render_flight_monitor_page():
 
             with col_att1:
                 fig_att = go.Figure()
-                fig_att.add_trace(go.Scatter(x=df['时间'], y=df['俯仰角'],
-                                             mode='lines', name='俯仰角',
+                fig_att.add_trace(go.Scatter(x=df['时间'], y=df['俯仰角'], mode='lines', name='俯仰角',
                                              line=dict(color='#4ECDC4', width=2)))
-                fig_att.add_trace(go.Scatter(x=df['时间'], y=df['横滚角'],
-                                             mode='lines', name='横滚角',
+                fig_att.add_trace(go.Scatter(x=df['时间'], y=df['横滚角'], mode='lines', name='横滚角',
                                              line=dict(color='#FFE66D', width=2)))
-                fig_att.update_layout(
-                    title='俯仰角/横滚角',
-                    template='plotly_dark',
-                    height=280,
-                    legend=dict(orientation="h", y=1.1),
-                    margin=dict(l=40, r=20, t=40, b=40)
-                )
+                fig_att.update_layout(title='俯仰角/横滚角', template='plotly_dark', height=280,
+                                      legend=dict(orientation="h", y=1.1), margin=dict(l=40, r=20, t=40, b=40))
                 st.plotly_chart(fig_att, use_container_width=True)
 
             with col_att2:
                 fig_alt = go.Figure()
-                fig_alt.add_trace(go.Scatter(
-                    x=df['时间'], y=df['高度'],
-                    mode='lines', name='高度',
-                    line=dict(color='#95E1D3', width=2),
-                    fill='tozeroy',
-                    fillcolor='rgba(149, 225, 211, 0.2)'
-                ))
-                fig_alt.update_layout(
-                    title='飞行高度',
-                    template='plotly_dark',
-                    height=280,
-                    margin=dict(l=40, r=20, t=40, b=40)
-                )
+                fig_alt.add_trace(go.Scatter(x=df['时间'], y=df['高度'], mode='lines', name='高度',
+                                              line=dict(color='#95E1D3', width=2), fill='tozeroy',
+                                              fillcolor='rgba(149, 225, 211, 0.2)'))
+                fig_alt.update_layout(title='飞行高度', template='plotly_dark', height=280,
+                                       margin=dict(l=40, r=20, t=40, b=40))
                 st.plotly_chart(fig_alt, use_container_width=True)
 
             with st.expander("📋 查看原始数据"):
@@ -355,8 +503,7 @@ def render_flight_monitor_page():
                 st.subheader("📝 状态日志")
                 logs = uav.get_status_log(last_n=10)
                 if logs:
-                    log_text = "\n".join(logs[-10:])
-                    st.code(log_text, language="log", height=200)
+                    st.code("\n".join(logs[-10:]), language="log", height=200)
                 else:
                     st.info("暂无日志")
 
@@ -364,8 +511,7 @@ def render_flight_monitor_page():
                 st.subheader("🚨 告警记录")
                 alerts = ground_station.get_alerts(last_n=10)
                 if alerts:
-                    alert_text = "\n".join(alerts[-10:])
-                    st.code(alert_text, language="log", height=200)
+                    st.code("\n".join(alerts[-10:]), language="log", height=200)
                 else:
                     st.success("✅ 无告警记录")
         else:

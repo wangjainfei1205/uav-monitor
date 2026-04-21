@@ -1,11 +1,7 @@
 import streamlit as st
-import sys
-import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from modules.route_planning import render_route_planning_page
-from modules.flight_monitor import render_flight_monitor_page
+from route_planning import render_route_planning_page
+from flight_monitor import render_flight_monitor_page
 
 st.set_page_config(
     page_title="无人机智能化应用系统",
@@ -64,19 +60,8 @@ def main():
 def render_home_page():
     st.markdown("""
     <style>
-        .main-header {
-            font-size: 2.5rem;
-            font-weight: bold;
-            color: #00D4AA;
-            text-align: center;
-            margin-bottom: 1rem;
-        }
-        .sub-header {
-            font-size: 1.2rem;
-            color: #888;
-            text-align: center;
-            margin-bottom: 2rem;
-        }
+        .main-header { font-size: 2.5rem; font-weight: bold; color: #00D4AA; text-align: center; margin-bottom: 1rem; }
+        .sub-header { font-size: 1.2rem; color: #888; text-align: center; margin-bottom: 2rem; }
     </style>
     """, unsafe_allow_html=True)
     
@@ -91,7 +76,7 @@ def render_home_page():
         st.markdown("""
         ### 🗺️ 航线规划
         
-        - 地图展示（支持全球范围）
+        - 地图展示（支持普通地图和卫星地图）
         - A/B点坐标设置（中国范围）
         - 障碍物标记与记忆
         - 航线距离计算
