@@ -23,11 +23,17 @@ class HeartbeatPacket:
         self.longitude = longitude
 
 class Waypoint:
-    def __init__(self, lat, lng, altitude=100.0, speed=15.0):
+    def __init__(self, lat, lng, altitude=100.0, speed=15.0, name=""):
         self.lat = lat
         self.lng = lng
         self.altitude = altitude
         self.speed = speed
+        self.name = name
+
+class Obstacle:
+    def __init__(self, name, coords):
+        self.name = name
+        self.coords = coords
 
 class UAVSimulator:
     def __init__(self, interval=1.0, offline_threshold=3.0):
@@ -42,21 +48,38 @@ class UAVSimulator:
         self.base_lat = 32.234104
         self.base_lon = 118.749421
         self.waypoints = []
+        self.obstacles = []
         self.current_waypoint_index = 0
         self.progress_to_next_waypoint = 0.0
         self.flying_route = False
+        self.safety_distance = 0.0002
         self._generate_default_route()
     
     def _generate_default_route(self):
         self.waypoints = [
-            Waypoint(32.234104, 118.749421, 100.0),
-            Waypoint(32.234500, 118.750000, 100.0),
-            Waypoint(32.235000, 118.749800, 120.0),
-            Waypoint(32.235200, 118.749000, 120.0),
-            Waypoint(32.234800, 118.748500, 100.0),
-            Waypoint(32.234300, 118.748800, 100.0),
-            Waypoint(32.234104, 118.749421, 100.0),
+            Waypoint(32.234104, 118.749421, 100.0, 15.0, "起点"),
+            Waypoint(32.234500, 118.750000, 100.0, 15.0, "航点1"),
+            Waypoint(32.235000, 118.749800, 120.0, 18.0, "航点2"),
+            Waypoint(32.235200, 118.749000, 120.0, 15.0, "航点3"),
+            Waypoint(32.234800, 118.748500, 100.0, 15.0, "航点4"),
+            Waypoint(32.234300, 118.748800, 100.0, 15.0, "航点5"),
+            Waypoint(32.234104, 118.749421, 100.0, 15.0, "终点"),
         ]
+    
+    def load_route_from_file(self, filename='route.json'):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.waypoints = [Waypoint(wp['lat'], wp['lng'], wp.get('altitude', 100.0), wp.get('speed', 15.0), wp.get('name', '')) for wp in data.get('waypoints', [])]
+            self.obstacles = [Obstacle(obs['name'], obs['coords']) for obs in data.get('obstacles', [])]
+            self.safety_distance = data.get('safety_distance', 0.0002)
+            self.current_waypoint_index = 0
+            self.progress_to_next_waypoint = 0.0
+            self.flying_route = len(self.waypoints) >= 2
+            return True
+        except Exception as e:
+            print(f"Failed to load route: {e}")
+            return False
     
     def set_circular_route(self, center_lat, center_lng, radius_km, num_points=8):
         waypoints = []
@@ -64,7 +87,7 @@ class UAVSimulator:
             angle = (i / num_points) * 2 * math.pi
             dx = radius_km * math.cos(angle) / 111.0
             dy = radius_km * math.sin(angle) / 111.0
-            waypoints.append(Waypoint(center_lat + dx, center_lng + dy))
+            waypoints.append(Waypoint(center_lat + dx, center_lng + dy, 100.0, 15.0, f"WP{i+1}"))
         waypoints.append(waypoints[0])
         self.waypoints = waypoints
         self.current_waypoint_index = 0
@@ -73,16 +96,49 @@ class UAVSimulator:
     
     def set_rectangular_route(self, start_lat, start_lng, width_km, height_km):
         waypoints = [
-            Waypoint(start_lat, start_lng),
-            Waypoint(start_lat, start_lng + width_km / 111.0),
-            Waypoint(start_lat + height_km / 111.0, start_lng + width_km / 111.0),
-            Waypoint(start_lat + height_km / 111.0, start_lng),
-            Waypoint(start_lat, start_lng),
+            Waypoint(start_lat, start_lng, 100.0, 15.0, "起点"),
+            Waypoint(start_lat, start_lng + width_km / 111.0, 100.0, 15.0, "WP1"),
+            Waypoint(start_lat + height_km / 111.0, start_lng + width_km / 111.0, 100.0, 15.0, "WP2"),
+            Waypoint(start_lat + height_km / 111.0, start_lng, 100.0, 15.0, "WP3"),
+            Waypoint(start_lat, start_lng, 100.0, 15.0, "终点"),
         ]
         self.waypoints = waypoints
         self.current_waypoint_index = 0
         self.progress_to_next_waypoint = 0.0
         self.flying_route = True
+    
+    def _point_in_polygon(self, lat, lng, polygon_coords):
+        n = len(polygon_coords)
+        inside = False
+        for i in range(n):
+            j = (i + 1) % n
+            xi, yi = polygon_coords[i]
+            xj, yj = polygon_coords[j]
+            if ((yi > lat) != (yj > lat)):
+                x_intersect = (lat - yi) * (xj - xi) / (yj - yi) + xi
+                if lng < x_intersect + self.safety_distance:
+                    inside = not inside
+        return inside
+    
+    def _check_obstacle_collision(self, lat, lng):
+        for obs in self.obstacles:
+            if self._point_in_polygon(lat, lng, obs.coords):
+                return obs
+        return None
+    
+    def _calculate_detour(self, current_lat, current_lng, target_lat, target_lng):
+        mid_lat = (current_lat + target_lat) / 2
+        mid_lng = (current_lng + target_lng) / 2
+        
+        perp_lat = -(target_lng - current_lng)
+        perp_lng = target_lat - current_lat
+        length = math.sqrt(perp_lat**2 + perp_lng**2)
+        if length > 0:
+            perp_lat /= length
+            perp_lng /= length
+        
+        offset = self.safety_distance * 3
+        return mid_lat + perp_lat * offset, mid_lng + perp_lng * offset
     
     def _get_current_position(self):
         if not self.flying_route or len(self.waypoints) < 2:
@@ -103,6 +159,12 @@ class UAVSimulator:
         alt = current_wp.altitude + (next_wp.altitude - current_wp.altitude) * self.progress_to_next_waypoint
         spd = current_wp.speed + (next_wp.speed - current_wp.speed) * self.progress_to_next_waypoint
         
+        obstacle = self._check_obstacle_collision(lat, lng)
+        if obstacle:
+            detour_lat, detour_lng = self._calculate_detour(lat, lng, next_wp.lat, next_wp.lng)
+            lat, lng = detour_lat, detour_lng
+            spd *= 0.8
+        
         self.progress_to_next_waypoint += 0.02
         
         if self.progress_to_next_waypoint >= 1.0:
@@ -113,8 +175,8 @@ class UAVSimulator:
         return (
             lat + random.uniform(-noise, noise),
             lng + random.uniform(-noise, noise),
-            alt + random.uniform(-2, 2),
-            spd + random.uniform(-1, 1)
+            max(50, alt + random.uniform(-2, 2)),
+            max(5, spd + random.uniform(-1, 1))
         )
     
     def _calculate_yaw(self, lat1, lng1, lat2, lng2):
@@ -131,7 +193,8 @@ class UAVSimulator:
                 next_wp = self.waypoints[self.current_waypoint_index + 1]
                 yaw = self._calculate_yaw(lat, lng, next_wp.lat, next_wp.lng)
             else:
-                yaw = random.uniform(0, 360)
+                next_wp = self.waypoints[0]
+                yaw = self._calculate_yaw(lat, lng, next_wp.lat, next_wp.lng)
         else:
             yaw = random.uniform(0, 360)
         
@@ -139,8 +202,8 @@ class UAVSimulator:
             seq=self.sequence,
             timestamp=datetime.now(),
             battery=max(20, 100 - self.sequence * 0.02 + random.uniform(-0.5, 0.5)),
-            altitude=max(50, alt),
-            speed=max(5, spd),
+            altitude=alt,
+            speed=spd,
             pitch=random.uniform(-2, 2),
             roll=random.uniform(-2, 2),
             yaw=yaw,
@@ -218,11 +281,15 @@ class UAVSimulator:
     
     def get_route_waypoints(self):
         return [(wp.lat, wp.lng) for wp in self.waypoints]
+    
+    def get_obstacles(self):
+        return [{'name': obs.name, 'coords': obs.coords} for obs in self.obstacles]
 
 class GroundStation:
     def __init__(self, uav):
         self.uav = uav
         self.alert_history = []
+        self.obstacle_alerts = []
         
     def monitor(self):
         is_offline = self.uav.check_offline()
@@ -234,19 +301,35 @@ class GroundStation:
             'offline_duration': self.uav.get_offline_duration() if is_offline else 0,
             'latest_packet': latest,
             'sequence': latest.seq if latest else 0,
-            'last_time': latest.timestamp if latest else None
+            'last_time': latest.timestamp if latest else None,
+            'current_waypoint': self.uav.current_waypoint_index,
+            'total_waypoints': len(self.uav.waypoints)
         }
         
         if is_offline:
-            alert_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 警告: 无人机已离线 {result['offline_duration']:.1f} 秒!"
-            self.alert_history.append(alert_msg)
-            if len(self.alert_history) > 100:
-                self.alert_history = self.alert_history[-50:]
+            alert_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 警告: 无人机已离线 {result['offline_duration']:.1f} 秒!"
+            if alert_msg not in self.alert_history[-1:] and len(self.alert_history) == 0 or alert_msg != self.alert_history[-1]:
+                self.alert_history.append(alert_msg)
+        
+        if latest:
+            current_pos = (latest.latitude, latest.longitude)
+            for obs in self.uav.obstacles:
+                if self.uav._point_in_polygon(latest.latitude, latest.longitude, obs.coords):
+                    alert_msg = f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 警告: 接近障碍物 {obs.name}"
+                    if alert_msg not in self.obstacle_alerts[-1:] and len(self.obstacle_alerts) == 0 or alert_msg != self.obstacle_alerts[-1]:
+                        self.obstacle_alerts.append(alert_msg)
+                        self.alert_history.append(alert_msg)
+        
+        if len(self.alert_history) > 100:
+            self.alert_history = self.alert_history[-50:]
         
         return result
     
     def get_alerts(self, last_n=20):
         return self.alert_history[-last_n:]
+    
+    def get_obstacle_alerts(self, last_n=10):
+        return self.obstacle_alerts[-last_n:]
 
 def render_flight_monitor_page():
     st.header("🚁 飞行监控")
@@ -259,10 +342,10 @@ def render_flight_monitor_page():
     uav = st.session_state.uav_simulator
     ground_station = st.session_state.ground_station
 
-    tab_main, tab_data = st.tabs(["📡 实时监控", "📊 数据分析"])
+    tab_main, tab_data, tab_map = st.tabs(["📡 实时监控", "📊 数据分析", "🗺️ 地图监控"])
 
     with tab_main:
-        col_control, col_status, col_map = st.columns([1, 1, 2])
+        col_control, col_status = st.columns([1, 2])
 
         with col_control:
             st.subheader("🎮 控制面板")
@@ -281,10 +364,11 @@ def render_flight_monitor_page():
                     st.warning("⏹️ 无人机模拟已停止!")
                     st.rerun()
 
-            st.markdown("### 🛤️ 航线规划")
+            st.markdown("---")
+            st.subheader("🛤️ 航线管理")
             
             route_mode = st.selectbox("选择航线模式", 
-                                     ["默认航线", "矩形航线", "圆形航线"],
+                                     ["默认航线", "矩形航线", "圆形航线", "从文件加载"],
                                      key="route_mode")
             
             if route_mode == "矩形航线":
@@ -307,6 +391,14 @@ def render_flight_monitor_page():
                     uav.set_circular_route(uav.base_lat, uav.base_lon, radius_km, num_points)
                     st.success("✅ 圆形航线已设置!")
             
+            elif route_mode == "从文件加载":
+                if st.button("📥 加载航线规划", use_container_width=True):
+                    success = uav.load_route_from_file()
+                    if success:
+                        st.success(f"✅ 成功加载 {len(uav.waypoints)} 个航点和 {len(uav.obstacles)} 个障碍物!")
+                    else:
+                        st.error("❌ 加载失败，请先在航线规划页面保存航线")
+            
             else:
                 if st.button("应用默认航线", use_container_width=True):
                     uav._generate_default_route()
@@ -315,7 +407,8 @@ def render_flight_monitor_page():
                     uav.flying_route = True
                     st.success("✅ 默认航线已设置!")
 
-            st.markdown("### ⚙️ 参数设置")
+            st.markdown("---")
+            st.subheader("⚙️ 参数设置")
             new_interval = st.number_input(
                 "心跳间隔(秒)",
                 min_value=0.5, max_value=5.0,
@@ -332,7 +425,8 @@ def render_flight_monitor_page():
             if new_threshold != uav.offline_threshold:
                 uav.offline_threshold = new_threshold
 
-            st.markdown("### 🔌 离线测试")
+            st.markdown("---")
+            st.subheader("🔌 测试功能")
             if st.button("🔌 模拟离线5秒", key="simulate_offline", use_container_width=True):
                 if uav.is_running:
                     uav.stop()
@@ -376,75 +470,38 @@ def render_flight_monitor_page():
             latest = status['latest_packet']
             if latest:
                 st.markdown("---")
-                st.markdown("### 📈 实时数据")
+                st.subheader("📈 实时数据")
 
-                col_m1, col_m2 = st.columns(2)
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                 with col_m1:
                     battery_delta = f"{latest.battery - 100:.1f}%" if latest.battery < 30 else None
                     st.metric("🔋 电量", f"{latest.battery:.1f}%", battery_delta,
                              delta_color="inverse" if latest.battery < 30 else "normal")
                 with col_m2:
                     st.metric("📏 高度", f"{latest.altitude:.1f}m")
-
-                col_m3, col_m4 = st.columns(2)
                 with col_m3:
                     st.metric("⚡ 速度", f"{latest.speed:.1f}m/s")
                 with col_m4:
                     st.metric("🧭 偏航角", f"{latest.yaw:.1f}°")
 
-                st.markdown("### 📍 GPS坐标")
+                st.markdown("---")
+                st.subheader("📍 GPS坐标")
                 col_g1, col_g2 = st.columns(2)
                 with col_g1:
                     st.metric("纬度", f"{latest.latitude:.6f}°")
                 with col_g2:
                     st.metric("经度", f"{latest.longitude:.6f}°")
 
+                st.markdown("---")
+                st.subheader("🛤️ 航点进度")
+                if uav.flying_route and len(uav.waypoints) > 0:
+                    progress = (status['current_waypoint'] / max(1, status['total_waypoints'] - 1)) * 100
+                    st.progress(progress)
+                    st.markdown(f"当前航点: **{uav.waypoints[status['current_waypoint']].name if uav.waypoints[status['current_waypoint']].name else f'WP{status['current_waypoint'] + 1}'}** ({status['current_waypoint'] + 1}/{status['total_waypoints']})")
+                else:
+                    st.info("💡 未启用航线飞行")
+
                 st.caption(f"🕐 更新时间: {latest.timestamp.strftime('%H:%M:%S')}")
-
-        with col_map:
-            st.subheader("🗺️ 飞行轨迹")
-
-            df = uav.get_history_dataframe(last_n=50)
-            route_waypoints = uav.get_route_waypoints()
-
-            if not df.empty and len(df) >= 2:
-                latest_lat = df['纬度'].iloc[-1]
-                latest_lon = df['经度'].iloc[-1]
-                center_lat = df['纬度'].mean()
-                center_lon = df['经度'].mean()
-
-                route_coords = [[row['纬度'], row['经度']] for _, row in df.iterrows()]
-                planned_route_coords = [[wp[0], wp[1]] for wp in route_waypoints]
-
-                map_html = """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="utf-8">
-                    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-                    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-                    <style>#map { width: 100%; height: 400px; margin: 0; }</style>
-                </head>
-                <body>
-                    <div id="map"></div>
-                    <script>
-                        var map = L.map('map').setView([""" + f"{center_lat}, {center_lon}" + """], 16);
-                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                            attribution: '© OpenStreetMap', maxZoom: 19
-                        }).addTo(map);
-                        """ + ("L.polyline(" + json.dumps(planned_route_coords) + ", {color: '#FFA500', weight: 3, dashArray: '10, 5', opacity: 0.8}).addTo(map);" if planned_route_coords else "") + """
-                        var routeLine = L.polyline(""" + json.dumps(route_coords) + """, {color: '#3366FF', weight: 3, opacity: 0.7}).addTo(map);
-                        L.circleMarker(""" + json.dumps(route_coords[0]) + """, {radius: 8, color: '#28a745', fillColor: '#28a745', fillOpacity: 1}).addTo(map).bindPopup('<b style="color:green;">起点</b>');
-                        """ + ("""for(var i=0; i<""" + str(len(planned_route_coords)) + """;i++){L.circleMarker(planned_route_coords[i],{radius:6,color:"#FFA500",fillColor:"#FFA500",fillOpacity:1}).addTo(map).bindPopup("航点 "+(i+1));}""" if planned_route_coords else "") + """
-                        L.circleMarker([""" + f"{latest_lat}, {latest_lon}" + """], {radius: 10, color: '#FF6B6B', fillColor: '#FF6B6B', fillOpacity: 1}).addTo(map).bindPopup('<b style="color:red;">当前位置</b><br>序号: """ + str(status['sequence']) + """');
-                        map.fitBounds(routeLine.getBounds(), {padding: [20, 20]});
-                    </script>
-                </body>
-                </html>
-                """
-                components.html(map_html, height=420, scrolling=False)
-            else:
-                st.info("💡 启动模拟后将在地图上显示飞行轨迹")
 
     with tab_data:
         df = uav.get_history_dataframe(last_n=100)
@@ -517,6 +574,134 @@ def render_flight_monitor_page():
                     st.success("✅ 无告警记录")
         else:
             st.info("💡 暂无数据，请点击「启动模拟」开始采集数据")
+
+    with tab_map:
+        st.subheader("🗺️ 飞行监控地图")
+
+        df = uav.get_history_dataframe(last_n=50)
+        route_waypoints = uav.get_route_waypoints()
+        obstacles = uav.get_obstacles()
+
+        if not df.empty and len(df) >= 2:
+            latest_lat = df['纬度'].iloc[-1]
+            latest_lon = df['经度'].iloc[-1]
+            center_lat = df['纬度'].mean()
+            center_lon = df['经度'].mean()
+
+            route_coords = [[row['纬度'], row['经度']] for _, row in df.iterrows()]
+            planned_route_coords = [[wp[0], wp[1]] for wp in route_waypoints]
+            obstacles_json = json.dumps(obstacles)
+
+            map_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+                <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+                <style>
+                    #map {{ width: 100%; height: 550px; margin: 0; }}
+                    .info {{ position: absolute; top: 10px; right: 10px; z-index: 1000; background: rgba(255,255,255,0.9); padding: 10px; border-radius: 5px; font-size: 12px; }}
+                    .legend {{ position: absolute; bottom: 10px; left: 10px; z-index: 1000; background: rgba(255,255,255,0.9); padding: 8px; border-radius: 5px; font-size: 11px; }}
+                </style>
+            </head>
+            <body>
+                <div id="map"></div>
+                <div class="info">
+                    <div><strong>📍 无人机状态</strong></div>
+                    <div>状态: <span style="color: {'green' if {status['is_offline'] == False} else 'red'}">{'在线' if {status['is_offline'] == False} else '离线'}</span></div>
+                    <div>航点: {len(route_waypoints)} 个</div>
+                    <div>障碍物: {len(obstacles)} 个</div>
+                </div>
+                <div class="legend">
+                    <div><b>图例</b></div>
+                    <div>🟢 起点</div>
+                    <div>🔴 当前位置</div>
+                    <div>🔵 实际轨迹</div>
+                    <div>🟠 规划航线</div>
+                    <div>🟡 障碍物</div>
+                </div>
+                <script>
+                    var map = L.map('map').setView([{center_lat}, {center_lon}], 16);
+                    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                        attribution: '© OpenStreetMap', maxZoom: 19
+                    }}).addTo(map);
+                    L.control.scale({{imperial: false}}).addTo(map);
+
+                    var plannedRoute = {json.dumps(planned_route_coords)};
+                    if (plannedRoute.length > 1) {{
+                        L.polyline(plannedRoute, {{color: '#FFA500', weight: 3, dashArray: '10, 5', opacity: 0.8}}).addTo(map);
+                        plannedRoute.forEach(function(wp, index) {{
+                            L.circleMarker(wp, {{radius: 6, color: '#FFA500', fillColor: '#FFA500', fillOpacity: 1}})
+                                .addTo(map).bindPopup('航点 ' + (index + 1));
+                        }});
+                    }}
+
+                    var obstacles = {obstacles_json};
+                    obstacles.forEach(function(obs) {{
+                        L.polygon(obs.coords, {{
+                            color: '#FFD700',
+                            fillColor: '#FFD700',
+                            fillOpacity: 0.3,
+                            weight: 2
+                        }}).addTo(map).bindPopup('障碍物: ' + obs.name);
+                    }});
+
+                    var flightPath = {json.dumps(route_coords)};
+                    if (flightPath.length > 1) {{
+                        L.polyline(flightPath, {{color: '#3366FF', weight: 3, opacity: 0.7}}).addTo(map);
+                        L.circleMarker(flightPath[0], {{radius: 6, color: '#28a745', fillColor: '#28a745', fillOpacity: 1}})
+                            .addTo(map).bindPopup('起点');
+                    }}
+
+                    L.circleMarker([{latest_lat}, {latest_lon}], {{
+                        radius: 10, 
+                        color: '#FF6B6B', 
+                        fillColor: '#FF6B6B', 
+                        fillOpacity: 1,
+                        weight: 2
+                    }}).addTo(map).bindPopup('<b style="color:red;">当前位置</b>');
+
+                    map.fitBounds(L.latLngBounds(flightPath), {{padding: [30, 30]}});
+                </script>
+            </body>
+            </html>
+            """
+            components.html(map_html, height=580, scrolling=False)
+        else:
+            map_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+                <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+                <style>html, body, #map {{ width: 100%; height: 550px; margin: 0; }}</style>
+            </head>
+            <body>
+                <div id="map"></div>
+                <script>
+                    var map = L.map('map').setView([{uav.base_lat}, {uav.base_lon}], 15);
+                    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                        attribution: '© OpenStreetMap', maxZoom: 19
+                    }}).addTo(map);
+                    L.control.scale({{imperial: false}}).addTo(map);
+                    
+                    var routeCoords = {json.dumps(route_waypoints)};
+                    if (routeCoords.length > 1) {{
+                        L.polyline(routeCoords, {{color: '#FFA500', weight: 3, dashArray: '10, 5'}}).addTo(map);
+                    }}
+                    
+                    var obstacles = {json.dumps(obstacles)};
+                    obstacles.forEach(function(obs) {{
+                        L.polygon(obs.coords, {{color: '#FFD700', fillColor: '#FFD700', fillOpacity: 0.3}}).addTo(map);
+                    }});
+                </script>
+            </body>
+            </html>
+            """
+            components.html(map_html, height=580, scrolling=False)
+            st.info("💡 启动模拟后将在地图上显示飞行轨迹")
 
     if uav.is_running:
         time.sleep(0.8)
