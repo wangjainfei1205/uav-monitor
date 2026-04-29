@@ -83,12 +83,24 @@ def render_route_planning_page():
     col1, col2 = st.columns([1, 2])
 
     with col1:
+        st.info(f"🎯 当前模式：{'📍 航点模式（点击地图加航点）' if st.session_state.map_click_mode == 'waypoint' else '🚧 障碍物模式（点击地图加顶点）'}")
+        
+        mode1, mode2 = st.columns(2)
+        with mode1:
+            if st.button("📍 航点模式", type="primary" if st.session_state.map_click_mode == "waypoint" else "secondary"):
+                st.session_state.map_click_mode = "waypoint"
+                st.rerun()
+        with mode2:
+            if st.button("🚧 障碍物模式", type="primary" if st.session_state.map_click_mode == "obstacle" else "secondary"):
+                st.session_state.map_click_mode = "obstacle"
+                st.rerun()
+
+        st.markdown("---")
+
         tab1, tab2 = st.tabs(["📍 航点管理", "🚧 障碍物管理"])
 
         with tab1:
             st.subheader("添加航点")
-
-            st.info("💡 在右侧地图上点击添加航点，或手动输入")
 
             wp_lat = st.number_input("纬度", value=NANJING_LAT, step=0.0001, format="%.6f", key="wp_lat")
             wp_lng = st.number_input("经度", value=NANJING_LNG, step=0.0001, format="%.6f", key="wp_lng")
@@ -124,8 +136,6 @@ def render_route_planning_page():
 
         with tab2:
             st.subheader("添加障碍物")
-
-            st.info("💡 在右侧地图上点击添加障碍物顶点（至少3个）")
 
             obs_name = st.text_input("障碍物名称", placeholder="障碍物1", key="obs_name")
 
@@ -227,11 +237,16 @@ def render_route_planning_page():
             lat = map_output['last_clicked'].get('lat')
             lng = map_output['last_clicked'].get('lng')
             if lat and lng:
-                new_wp_name = f"航点{len(data['waypoints'])+1}"
-                data['waypoints'].append({'lat': lat, 'lng': lng, 'name': new_wp_name})
-                save_data(data)
-                st.success(f"✅ {new_wp_name} 已添加到地图点击位置！")
-                st.rerun()
+                if st.session_state.map_click_mode == 'waypoint':
+                    new_wp_name = f"航点{len(data['waypoints'])+1}"
+                    data['waypoints'].append({'lat': lat, 'lng': lng, 'name': new_wp_name})
+                    save_data(data)
+                    st.success(f"✅ {new_wp_name} 已添加到地图点击位置！")
+                    st.rerun()
+                else:
+                    st.session_state.temp_obstacle.append((lat, lng))
+                    st.success(f"✅ 已添加第 {len(st.session_state.temp_obstacle)} 个顶点！")
+                    st.rerun()
 
 def render_flight_monitor_page():
     st.header("🚁 飞行监控")
