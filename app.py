@@ -7,7 +7,7 @@ import json
 import os
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 
 st.set_page_config(
     page_title="无人机智能化应用系统",
@@ -39,7 +39,7 @@ def load_data(filename='route.json'):
                 return json.load(f)
         except:
             pass
-    return {'waypoints': [], 'obstacles': []}
+    return {'waypoints': [], 'obstacles': [], 'safety_radius': 30, 'uav_altitude': 100}
 
 def init_session_state():
     if 'data' not in st.session_state:
@@ -58,23 +58,198 @@ def init_session_state():
         st.session_state.temp_obstacle = []
     if 'map_click_mode' not in st.session_state:
         st.session_state.map_click_mode = 'waypoint'
+    if 'current_waypoint' not in st.session_state:
+        st.session_state.current_waypoint = 0
+    if 'start_time' not in st.session_state:
+        st.session_state.start_time = None
+    if 'total_distance' not in st.session_state:
+        st.session_state.total_distance = 0.0
+    if 'completed_distance' not in st.session_state:
+        st.session_state.completed_distance = 0.0
+    if 'flight_speed' not in st.session_state:
+        st.session_state.flight_speed = 15.0
+    if 'planned_route' not in st.session_state:
+        st.session_state.planned_route = []
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_phi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(delta_lambda/2)**2
+    c = 2*math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return R * c
+
+def point_to_polygon_distance(point, polygon):
+    min_dist = float('inf')
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i+1)%n]
+        dist = point_to_segment_distance(point[0], point[1], x1, y1, x2, y2)
+        if dist < min_dist:
+            min_dist = dist
+    return min_dist
+
+def point_to_segment_distance(px, py, x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return math.hypot(px - x1, py - y1)
+    
+    t = ((px - x1)*dx + (py - y1)*dy) / (dx*dx + dy*dy)
+    t = max(0, min(1, t))
+    
+    nx = x1 + t*dx
+    ny = y1 + t*dy
+    
+    return math.hypot(px - nx, py - ny)
+
+def check_route_conflict(waypoints, obstacles, safety_radius, uav_altitude):
+    conflicts = []
+    needs_flyaround = []
+    
+    for i in range(len(waypoints)-1):
+        wp1 = waypoints[i]
+        wp2 = waypoints[i+1]
+        
+        for j, obs in enumerate(obstacles):
+            obs_height = obs.get('height', 50)
+            if obs_height >= uav_altitude:
+                min_dist = point_to_polygon_distance((wp1['lat'], wp1['lng']), obs['coords'])
+                if min_dist < safety_radius / 111000:
+                    conflicts.append(f"航段 {wp1['name']}-{wp2['name']} 与障碍物 {obs['name']} 距离过近")
+                    needs_flyaround.append((i, j))
+                
+                min_dist = point_to_polygon_distance((wp2['lat'], wp2['lng']), obs['coords'])
+                if min_dist < safety_radius / 111000:
+                    conflicts.append(f"航段 {wp1['name']}-{wp2['name']} 与障碍物 {obs['name']} 距离过近")
+                    needs_flyaround.append((i, j))
+    
+    return conflicts, needs_flyaround
+
+def calculate_flyaround(wp1, wp2, obstacle, mode='optimal', safety_radius=30):
+    obs_coords = obstacle['coords']
+    obs_center_lat = sum(c[0] for c in obs_coords) / len(obs_coords)
+    obs_center_lng = sum(c[1] for c in obs_coords) / len(obs_coords)
+    
+    dx = wp2['lng'] - wp1['lng']
+    dy = wp2['lat'] - wp1['lat']
+    
+    perp_x = -dy
+    perp_y = dx
+    perp_len = math.sqrt(perp_x**2 + perp_y**2)
+    if perp_len > 0:
+        perp_x /= perp_len
+        perp_y /= perp_len
+    
+    safety_offset = safety_radius / 111000
+    
+    if mode == 'left':
+        flyaround_points = [
+            (wp1['lat'], wp1['lng']),
+            (wp1['lat'] + perp_y * safety_offset * 2, wp1['lng'] + perp_x * safety_offset * 2),
+            (obs_center_lat + perp_y * safety_offset * 3, obs_center_lng + perp_x * safety_offset * 3),
+            (wp2['lat'] + perp_y * safety_offset * 2, wp2['lng'] + perp_x * safety_offset * 2),
+            (wp2['lat'], wp2['lng'])
+        ]
+    elif mode == 'right':
+        flyaround_points = [
+            (wp1['lat'], wp1['lng']),
+            (wp1['lat'] - perp_y * safety_offset * 2, wp1['lng'] - perp_x * safety_offset * 2),
+            (obs_center_lat - perp_y * safety_offset * 3, obs_center_lng - perp_x * safety_offset * 3),
+            (wp2['lat'] - perp_y * safety_offset * 2, wp2['lng'] - perp_x * safety_offset * 2),
+            (wp2['lat'], wp2['lng'])
+        ]
+    else:
+        angle1 = math.atan2(obs_center_lat - wp1['lat'], obs_center_lng - wp1['lng'])
+        angle2 = math.atan2(wp2['lat'] - obs_center_lat, wp2['lng'] - obs_center_lng)
+        
+        radius = safety_offset * 2
+        
+        mid_angle = (angle1 + angle2) / 2
+        arc_center_lat = obs_center_lat - math.sin(mid_angle) * radius * 1.5
+        arc_center_lng = obs_center_lng + math.cos(mid_angle) * radius * 1.5
+        
+        num_points = 10
+        flyaround_points = [(wp1['lat'], wp1['lng'])]
+        
+        for i in range(1, num_points):
+            t = i / num_points
+            angle = angle1 + (angle2 - angle1) * t
+            px = arc_center_lat + math.sin(angle) * radius * 1.5
+            py = arc_center_lng - math.cos(angle) * radius * 1.5
+            flyaround_points.append((px, py))
+        
+        flyaround_points.append((wp2['lat'], wp2['lng']))
+    
+    return flyaround_points
+
+def generate_route_with_flyaround(waypoints, obstacles, safety_radius, uav_altitude, mode='optimal'):
+    planned_route = []
+    
+    for i in range(len(waypoints)-1):
+        wp1 = waypoints[i]
+        wp2 = waypoints[i+1]
+        
+        need_flyaround = False
+        affected_obs = None
+        
+        for obs in obstacles:
+            obs_height = obs.get('height', 50)
+            if obs_height >= uav_altitude:
+                min_dist = point_to_polygon_distance((wp1['lat'], wp1['lng']), obs['coords'])
+                if min_dist < safety_radius / 111000:
+                    need_flyaround = True
+                    affected_obs = obs
+                    break
+        
+        if need_flyaround and affected_obs:
+            flyaround_points = calculate_flyaround(wp1, wp2, affected_obs, mode, safety_radius)
+            planned_route.extend(flyaround_points[:-1])
+        else:
+            planned_route.append((wp1['lat'], wp1['lng']))
+    
+    if waypoints:
+        planned_route.append((waypoints[-1]['lat'], waypoints[-1]['lng']))
+    
+    return planned_route
 
 def render_home_page():
     st.markdown('<h1 style="text-align: center; color: #00D4AA; font-size: 2.5rem; font-weight: bold;">🚁 无人机智能化应用系统</h1>', unsafe_allow_html=True)
     st.markdown("---")
+    
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("""
         ### 🗺️ 航线规划
         - 卫星地图展示
-        - 添加航点和障碍物（支持地图点击）
+        - 航点添加（地图点击）
+        - 障碍物多边形圈选（含高度设置）
+        - 安全半径设置与检测
+        - 绕飞路径规划（左/右/最优）
         """)
     with col2:
         st.markdown("""
         ### 🚁 飞行监控
-        - 心跳包实时监控
-        - 飞行轨迹实时显示
+        - 按航点飞行模拟
+        - 实时状态监测
+        - 电量模拟与预警
+        - 飞行数据可视化
         """)
+    
+    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+    with col_f1:
+        st.metric("航点数量", len(st.session_state.data['waypoints']))
+    with col_f2:
+        st.metric("障碍物数量", len(st.session_state.data['obstacles']))
+    with col_f3:
+        st.metric("安全半径", f"{st.session_state.data.get('safety_radius', 30)}m")
+    with col_f4:
+        st.metric("飞行高度", f"{st.session_state.data.get('uav_altitude', 100)}m")
 
 def render_route_planning_page():
     st.header("🗺️ 航线规划")
@@ -94,6 +269,31 @@ def render_route_planning_page():
             if st.button("🚧 障碍物模式", type="primary" if st.session_state.map_click_mode == "obstacle" else "secondary"):
                 st.session_state.map_click_mode = "obstacle"
                 st.rerun()
+
+        st.markdown("---")
+
+        uav_altitude = st.slider("✈️ 无人机飞行高度 (米)", min_value=20, max_value=500, value=data.get('uav_altitude', 100), step=10)
+        data['uav_altitude'] = uav_altitude
+        
+        safety_radius = st.slider("🛡️ 安全半径 (米)", min_value=10, max_value=100, value=data.get('safety_radius', 30), step=5)
+        data['safety_radius'] = safety_radius
+        
+        save_data(data)
+
+        st.markdown("---")
+
+        st.subheader("🔄 绕飞模式")
+        flyaround_mode = st.selectbox("选择绕飞策略", ['optimal', 'left', 'right'], 
+                                    format_func=lambda x: {'optimal': '最优路径（弧线）', 'left': '向左绕飞', 'right': '向右绕飞'}[x])
+        st.session_state.flyaround_mode = flyaround_mode
+
+        if st.button("📐 计算绕飞航线", use_container_width=True):
+            if len(data['waypoints']) >= 2:
+                route = generate_route_with_flyaround(data['waypoints'], data['obstacles'], safety_radius, uav_altitude, flyaround_mode)
+                st.session_state.planned_route = route
+                st.success("✅ 绕飞航线计算完成！")
+            else:
+                st.warning("⚠️ 请先添加至少2个航点")
 
         st.markdown("---")
 
@@ -117,6 +317,7 @@ def render_route_planning_page():
             with col_btn2:
                 if st.button("🗑️ 清空航点", use_container_width=True):
                     data['waypoints'] = []
+                    st.session_state.planned_route = []
                     save_data(data)
                     st.success("✅ 已清空")
 
@@ -127,10 +328,12 @@ def render_route_planning_page():
                 for i, wp in enumerate(data['waypoints']):
                     col_wp1, col_wp2 = st.columns([4, 1])
                     with col_wp1:
-                        st.write(f"{i+1}. **{wp['name']}**: ({wp['lat']:.6f}, {wp['lng']:.6f})")
+                        status = "🟢 起点" if i == 0 else ("🔴 终点" if i == len(data['waypoints'])-1 else "")
+                        st.write(f"{i+1}. **{wp['name']}** {status}: ({wp['lat']:.6f}, {wp['lng']:.6f})")
                     with col_wp2:
                         if st.button("🗑️", key=f"del_wp_{i}"):
                             del data['waypoints'][i]
+                            st.session_state.planned_route = []
                             save_data(data)
                             st.rerun()
 
@@ -138,6 +341,7 @@ def render_route_planning_page():
             st.subheader("添加障碍物")
 
             obs_name = st.text_input("障碍物名称", placeholder="障碍物1", key="obs_name")
+            obs_height = st.number_input("障碍物高度 (米)", min_value=1, max_value=500, value=50, step=10, key="obs_height")
 
             st.markdown(f"**已添加 {len(st.session_state.temp_obstacle)} 个顶点** (需要至少3个)")
 
@@ -146,7 +350,8 @@ def render_route_planning_page():
                 if st.button("➕ 添加障碍物", use_container_width=True):
                     if len(st.session_state.temp_obstacle) >= 3:
                         name = obs_name if obs_name else f"障碍物{len(data['obstacles'])+1}"
-                        data['obstacles'].append({'name': name, 'coords': st.session_state.temp_obstacle.copy()})
+                        data['obstacles'].append({'name': name, 'coords': st.session_state.temp_obstacle.copy(), 'height': obs_height})
+                        st.session_state.planned_route = []
                         save_data(data)
                         st.success(f"✅ {name} 添加成功！")
                         st.session_state.temp_obstacle = []
@@ -160,6 +365,7 @@ def render_route_planning_page():
 
             if st.button("🗑️ 清空所有障碍物", use_container_width=True):
                 data['obstacles'] = []
+                st.session_state.planned_route = []
                 save_data(data)
                 st.success("✅ 已清空")
 
@@ -173,28 +379,41 @@ def render_route_planning_page():
             if data['obstacles']:
                 st.subheader("障碍物列表")
                 for i, obs in enumerate(data['obstacles']):
+                    need_fly = "🔴 需要绕飞" if obs.get('height', 50) >= uav_altitude else "🟢 无需绕飞"
                     col_obs_n, col_obs_d = st.columns([4, 1])
                     with col_obs_n:
-                        st.write(f"{i+1}. **{obs['name']}** ({len(obs['coords'])}个顶点)")
+                        st.write(f"{i+1}. **{obs['name']}** {need_fly} (高度: {obs.get('height', 50)}m, {len(obs['coords'])}个顶点)")
                     with col_obs_d:
                         if st.button("🗑️", key=f"del_obs_{i}"):
                             del data['obstacles'][i]
+                            st.session_state.planned_route = []
                             save_data(data)
                             st.rerun()
 
         st.markdown("---")
 
+        total_dist = 0
+        if len(data['waypoints']) >= 2:
+            for i in range(len(data['waypoints']) - 1):
+                total_dist += haversine(data['waypoints'][i]['lat'], data['waypoints'][i]['lng'],
+                                      data['waypoints'][i+1]['lat'], data['waypoints'][i+1]['lng']) / 1000
+
         col_stat1, col_stat2 = st.columns(2)
         with col_stat1:
             st.metric("航点数量", len(data['waypoints']))
         with col_stat2:
-            if len(data['waypoints']) >= 2:
-                total_dist = 0
-                for i in range(len(data['waypoints']) - 1):
-                    lat1, lng1 = data['waypoints'][i]['lat'], data['waypoints'][i]['lng']
-                    lat2, lng2 = data['waypoints'][i+1]['lat'], data['waypoints'][i+1]['lng']
-                    total_dist += math.sqrt((lat2-lat1)**2 + (lng2-lng1)**2) * 111
-                st.metric("航线距离", f"{total_dist:.2f} km")
+            st.metric("航线距离", f"{total_dist:.2f} km")
+
+        if len(data['waypoints']) >= 2 and len(data['obstacles']) > 0:
+            conflicts, _ = check_route_conflict(data['waypoints'], data['obstacles'], safety_radius, uav_altitude)
+            if conflicts:
+                st.markdown("---")
+                st.subheader("⚠️ 安全警告")
+                for conflict in conflicts:
+                    st.warning(conflict)
+            else:
+                st.markdown("---")
+                st.success("✅ 航线安全检测通过！所有航段与障碍物距离符合安全要求")
 
     with col2:
         st.subheader("🗺️ 卫星地图")
@@ -212,7 +431,9 @@ def render_route_planning_page():
 
         m = create_satellite_map(center_lat, center_lng)
 
-        if len(data['waypoints']) >= 2:
+        if st.session_state.planned_route:
+            folium.PolyLine(st.session_state.planned_route, color='#00D4AA', weight=5, opacity=0.9, popup='规划航线').add_to(m)
+        elif len(data['waypoints']) >= 2:
             route_coords = [(wp['lat'], wp['lng']) for wp in data['waypoints']]
             folium.PolyLine(route_coords, color='#3366FF', weight=4, opacity=0.8).add_to(m)
 
@@ -221,7 +442,16 @@ def render_route_planning_page():
             folium.Marker([wp['lat'], wp['lng']], popup=f"{wp['name']} ({wp['lat']:.6f}, {wp['lng']:.6f})", icon=folium.Icon(color=color, icon='info-sign')).add_to(m)
 
         for obs in data['obstacles']:
-            folium.Polygon(obs['coords'], color='#FF6B6B', fill=True, fillColor='#FF6B6B', fillOpacity=0.3, weight=2, popup=obs['name']).add_to(m)
+            obs_height = obs.get('height', 50)
+            color = '#FF6B6B' if obs_height >= uav_altitude else '#4CAF50'
+            folium.Polygon(obs['coords'], color=color, fill=True, fillColor=color, fillOpacity=0.3, weight=2, 
+                        popup=f"{obs['name']} (高度: {obs_height}m)").add_to(m)
+            
+            obs_center_lat = sum(c[0] for c in obs['coords']) / len(obs['coords'])
+            obs_center_lng = sum(c[1] for c in obs['coords']) / len(obs['coords'])
+            folium.Circle([obs_center_lat, obs_center_lng], radius=safety_radius * 0.01, 
+                        color='orange', fill=False, weight=2, dash_array='5,5',
+                        popup=f"安全半径: {safety_radius}m").add_to(m)
 
         if len(st.session_state.temp_obstacle) >= 1:
             for coord in st.session_state.temp_obstacle:
@@ -240,6 +470,7 @@ def render_route_planning_page():
                 if st.session_state.map_click_mode == 'waypoint':
                     new_wp_name = f"航点{len(data['waypoints'])+1}"
                     data['waypoints'].append({'lat': lat, 'lng': lng, 'name': new_wp_name})
+                    st.session_state.planned_route = []
                     save_data(data)
                     st.success(f"✅ {new_wp_name} 已添加到地图点击位置！")
                     st.rerun()
@@ -251,43 +482,96 @@ def render_route_planning_page():
 def render_flight_monitor_page():
     st.header("🚁 飞行监控")
 
+    data = st.session_state.data
+
     col1, col2 = st.columns([1, 2])
 
     with col1:
         st.subheader("🎮 模拟控制")
 
-        if st.button("▶️ 启动模拟", use_container_width=True):
-            st.session_state.is_simulating = True
-            st.session_state.heartbeat_data = []
-            st.session_state.flight_path = []
-            st.session_state.battery_level = 100.0
-            st.success("✅ 模拟已启动")
+        col_ctrl1, col_ctrl2 = st.columns(2)
+        with col_ctrl1:
+            if st.button("▶️ 启动模拟", use_container_width=True):
+                if len(data['waypoints']) < 2:
+                    st.warning("⚠️ 请先添加至少2个航点！")
+                else:
+                    st.session_state.is_simulating = True
+                    st.session_state.heartbeat_data = []
+                    st.session_state.flight_path = []
+                    st.session_state.battery_level = 100.0
+                    st.session_state.current_position = [data['waypoints'][0]['lat'], data['waypoints'][0]['lng']]
+                    st.session_state.current_waypoint = 0
+                    st.session_state.start_time = datetime.now()
+                    st.session_state.completed_distance = 0.0
+                    st.session_state.total_distance = 0.0
+                    for i in range(len(data['waypoints']) - 1):
+                        st.session_state.total_distance += haversine(
+                            data['waypoints'][i]['lat'], data['waypoints'][i]['lng'],
+                            data['waypoints'][i+1]['lat'], data['waypoints'][i+1]['lng']
+                        )
+                    st.success("✅ 模拟已启动")
 
-        if st.button("⏹️ 停止模拟", use_container_width=True):
-            st.session_state.is_simulating = False
-            st.success("✅ 模拟已停止")
+        with col_ctrl2:
+            if st.button("⏹️ 停止模拟", use_container_width=True):
+                st.session_state.is_simulating = False
+                st.success("✅ 模拟已停止")
 
         st.markdown("---")
 
-        if st.session_state.heartbeat_data:
-            last_hb = st.session_state.heartbeat_data[-1]
-            st.metric("心跳序号", last_hb['seq'])
-            st.metric("电池电量", f"{st.session_state.battery_level:.1f}%")
-            st.metric("当前位置", f"({st.session_state.current_position[0]:.6f}, {st.session_state.current_position[1]:.6f})")
+        st.subheader("📊 飞行状态")
+
+        col_status1, col_status2 = st.columns(2)
+        
+        with col_status1:
+            if st.session_state.is_simulating:
+                wp = data['waypoints'][st.session_state.current_waypoint] if data['waypoints'] else None
+                if wp:
+                    st.metric("当前航点", f"{wp['name']} ({st.session_state.current_waypoint + 1}/{len(data['waypoints'])})")
+            else:
+                st.metric("当前航点", "未启动")
+
+        with col_status2:
+            st.metric("飞行速度", f"{st.session_state.flight_speed} m/s")
+
+        if st.session_state.is_simulating:
+            elapsed_time = datetime.now() - st.session_state.start_time
+            elapsed_str = str(elapsed_time).split('.')[0]
+            st.metric("已用时间", elapsed_str)
+
+            remaining_distance = st.session_state.total_distance - st.session_state.completed_distance
+            remaining_time = timedelta(seconds=remaining_distance / st.session_state.flight_speed) if st.session_state.flight_speed > 0 else timedelta(0)
+            st.metric("剩余距离", f"{remaining_distance/1000:.2f} km")
+            st.metric("预计到达", str(remaining_time).split('.')[0])
+
+            progress = (st.session_state.completed_distance / max(st.session_state.total_distance, 1)) * 100
+            st.progress(progress, text=f"航线进度: {progress:.1f}%")
+
+        st.markdown("---")
+
+        st.subheader("🔋 电量监控")
+        battery_color = "green" if st.session_state.battery_level > 50 else ("yellow" if st.session_state.battery_level > 20 else "red")
+        st.metric("电池电量", f"{st.session_state.battery_level:.1f}%")
+        st.progress(st.session_state.battery_level / 100)
+        if st.session_state.battery_level <= 20:
+            st.warning("⚠️ 电量不足！请尽快返航")
 
     with col2:
         st.subheader("🗺️ 飞行轨迹")
 
         m = create_satellite_map(st.session_state.current_position[0], st.session_state.current_position[1])
 
-        data = st.session_state.data
-        if data['waypoints']:
+        if st.session_state.planned_route:
+            folium.PolyLine(st.session_state.planned_route, color='#00D4AA', weight=3, opacity=0.7).add_to(m)
+        elif data['waypoints']:
             route_coords = [(wp['lat'], wp['lng']) for wp in data['waypoints']]
             folium.PolyLine(route_coords, color='#FFA500', weight=3, opacity=0.7).add_to(m)
 
+        if data['waypoints']:
             for i, wp in enumerate(data['waypoints']):
                 color = 'green' if i == 0 else ('red' if i == len(data['waypoints'])-1 else 'orange')
-                folium.Marker([wp['lat'], wp['lng']], popup=f"{wp['name']}", icon=folium.Icon(color=color, icon='info-sign')).add_to(m)
+                icon_color = 'blue' if i == st.session_state.current_waypoint else color
+                folium.Marker([wp['lat'], wp['lng']], popup=f"{wp['name']}", 
+                            icon=folium.Icon(color=icon_color, icon='info-sign')).add_to(m)
 
         if len(st.session_state.flight_path) > 1:
             folium.PolyLine(st.session_state.flight_path, color='#3366FF', weight=4, opacity=0.9).add_to(m)
@@ -299,7 +583,39 @@ def render_flight_monitor_page():
                 icon=folium.Icon(color='blue', icon='plane', prefix='glyphicon')
             ).add_to(m)
 
+        for obs in data['obstacles']:
+            obs_height = obs.get('height', 50)
+            color = '#FF6B6B' if obs_height >= data.get('uav_altitude', 100) else '#4CAF50'
+            folium.Polygon(obs['coords'], color=color, fill=True, fillColor=color, fillOpacity=0.3, weight=2).add_to(m)
+
         st_folium(m, width=700, height=500)
+
+    st.markdown("---")
+    
+    st.subheader("📈 数据图表")
+    
+    col_chart1, col_chart2 = st.columns(2)
+    
+    with col_chart1:
+        if st.session_state.heartbeat_data:
+            df = pd.DataFrame(st.session_state.heartbeat_data)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df['time'], y=df['seq'], mode='lines+markers', name='心跳序号'))
+            fig.update_layout(height=300, title='心跳包时序图')
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("💡 启动模拟后显示心跳曲线")
+
+    with col_chart2:
+        if st.session_state.heartbeat_data:
+            df = pd.DataFrame(st.session_state.heartbeat_data)
+            battery_values = [100 - i * 0.05 for i in range(len(df))]
+            fig_bat = go.Figure()
+            fig_bat.add_trace(go.Scatter(x=df['time'], y=battery_values, mode='lines', name='电量', line=dict(color='#4CAF50')))
+            fig_bat.update_layout(height=300, title='电量变化曲线')
+            st.plotly_chart(fig_bat, use_container_width=True)
+        else:
+            st.info("💡 启动模拟后显示电量曲线")
 
     if st.session_state.is_simulating:
         import time
@@ -307,12 +623,33 @@ def render_flight_monitor_page():
 
         seq = len(st.session_state.heartbeat_data) + 1
         st.session_state.heartbeat_data.append({'seq': seq, 'time': datetime.now().strftime("%H:%M:%S")})
-        st.session_state.battery_level = max(0, st.session_state.battery_level - 0.02)
 
-        lat = st.session_state.current_position[0] + (random.random() - 0.5) * 0.0001
-        lng = st.session_state.current_position[1] + (random.random() - 0.5) * 0.0001
-        st.session_state.current_position = [lat, lng]
-        st.session_state.flight_path.append((lat, lng))
+        st.session_state.battery_level = max(0, st.session_state.battery_level - 0.05)
+
+        if data['waypoints'] and st.session_state.current_waypoint < len(data['waypoints']):
+            target_wp = data['waypoints'][st.session_state.current_waypoint]
+            current_lat, current_lng = st.session_state.current_position
+
+            dlat = target_wp['lat'] - current_lat
+            dlng = target_wp['lng'] - current_lng
+            dist = math.sqrt(dlat**2 + dlng**2) * 111000
+
+            if dist < 5:
+                st.session_state.current_waypoint += 1
+                if st.session_state.current_waypoint >= len(data['waypoints']):
+                    st.session_state.is_simulating = False
+                    st.success("🎉 已到达终点！")
+            else:
+                step = 0.0001
+                current_lat += (dlat / (dist/111000)) * step
+                current_lng += (dlng / (dist/111000)) * step
+                current_lat += (random.random() - 0.5) * 0.00002
+                current_lng += (random.random() - 0.5) * 0.00002
+
+                st.session_state.completed_distance += 11.1
+
+            st.session_state.current_position = [current_lat, current_lng]
+            st.session_state.flight_path.append((current_lat, current_lng))
 
         st.rerun()
 
@@ -323,6 +660,24 @@ def main():
     st.sidebar.markdown("---")
 
     page = st.sidebar.radio("导航", ["🏠 首页", "🗺️ 航线规划", "🚁 飞行监控"])
+
+    st.sidebar.markdown("---")
+
+    with st.sidebar.expander("ℹ️ 系统信息"):
+        st.markdown("""
+        **版本**: v1.0.0
+        
+        **功能模块**:
+        - 航线规划（含安全半径）
+        - 障碍物圈选（高度设置）
+        - 绕飞路径规划（左/右/最优）
+        - 飞行监控模拟
+        
+        **技术栈**:
+        - Streamlit
+        - Folium卫星地图
+        - Plotly可视化
+        """)
 
     if page == "🏠 首页":
         render_home_page()
