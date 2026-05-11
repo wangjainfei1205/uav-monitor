@@ -70,6 +70,8 @@ def init_session_state():
         st.session_state.flight_speed = 15.0
     if 'planned_route' not in st.session_state:
         st.session_state.planned_route = []
+    if 'heading' not in st.session_state:
+        st.session_state.heading = 0.0
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -282,18 +284,35 @@ def render_route_planning_page():
 
         st.markdown("---")
 
-        st.subheader("🔄 绕飞模式")
-        flyaround_mode = st.selectbox("选择绕飞策略", ['optimal', 'left', 'right'], 
-                                    format_func=lambda x: {'optimal': '最优路径（弧线）', 'left': '向左绕飞', 'right': '向右绕飞'}[x])
-        st.session_state.flyaround_mode = flyaround_mode
+        st.subheader("🔄 绕飞路径规划")
 
-        if st.button("📐 计算绕飞航线", use_container_width=True):
-            if len(data['waypoints']) >= 2:
-                route = generate_route_with_flyaround(data['waypoints'], data['obstacles'], safety_radius, uav_altitude, flyaround_mode)
-                st.session_state.planned_route = route
-                st.success("✅ 绕飞航线计算完成！")
-            else:
-                st.warning("⚠️ 请先添加至少2个航点")
+        if len(data['waypoints']) >= 2:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("⬅️ 向左绕飞", use_container_width=True, type="primary"):
+                    route = generate_route_with_flyaround(data['waypoints'], data['obstacles'], safety_radius, uav_altitude, 'left')
+                    st.session_state.planned_route = route
+                    st.success("✅ 向左绕飞航线计算完成！")
+                    st.rerun()
+
+            with col2:
+                if st.button("🎯 最优路径（弧线）", use_container_width=True, type="primary"):
+                    route = generate_route_with_flyaround(data['waypoints'], data['obstacles'], safety_radius, uav_altitude, 'optimal')
+                    st.session_state.planned_route = route
+                    st.success("✅ 最优绕飞航线计算完成！")
+                    st.rerun()
+
+            with col3:
+                if st.button("➡️ 向右绕飞", use_container_width=True, type="primary"):
+                    route = generate_route_with_flyaround(data['waypoints'], data['obstacles'], safety_radius, uav_altitude, 'right')
+                    st.session_state.planned_route = route
+                    st.success("✅ 向右绕飞航线计算完成！")
+                    st.rerun()
+
+            if st.session_state.planned_route:
+                st.info(f"📊 当前规划了 {len(st.session_state.planned_route)} 个航点的绕飞路径")
+        else:
+            st.warning("⚠️ 请先添加至少2个航点才能进行绕飞规划")
 
         st.markdown("---")
 
@@ -479,6 +498,32 @@ def render_route_planning_page():
                     st.success(f"✅ 已添加第 {len(st.session_state.temp_obstacle)} 个顶点！")
                     st.rerun()
 
+def calculate_heading(from_lat, from_lng, to_lat, to_lng):
+    """计算从一点到另一点的航向角度（0-360度）"""
+    dlat = to_lat - from_lat
+    dlng = to_lng - from_lng
+    angle = math.degrees(math.atan2(dlng, dlat))
+    return (angle + 360) % 360
+
+def get_heading_direction(heading):
+    """获取航向方向文本"""
+    if heading < 22.5 or heading >= 337.5:
+        return "北"
+    elif heading < 67.5:
+        return "东北"
+    elif heading < 112.5:
+        return "东"
+    elif heading < 157.5:
+        return "东南"
+    elif heading < 202.5:
+        return "南"
+    elif heading < 247.5:
+        return "西南"
+    elif heading < 292.5:
+        return "西"
+    else:
+        return "西北"
+
 def render_flight_monitor_page():
     st.header("🚁 飞行监控")
 
@@ -504,6 +549,7 @@ def render_flight_monitor_page():
                     st.session_state.start_time = datetime.now()
                     st.session_state.completed_distance = 0.0
                     st.session_state.total_distance = 0.0
+                    st.session_state.heading = 0.0
                     for i in range(len(data['waypoints']) - 1):
                         st.session_state.total_distance += haversine(
                             data['waypoints'][i]['lat'], data['waypoints'][i]['lng'],
@@ -520,20 +566,29 @@ def render_flight_monitor_page():
 
         st.subheader("📊 飞行状态")
 
-        col_status1, col_status2 = st.columns(2)
-        
-        with col_status1:
-            if st.session_state.is_simulating:
-                wp = data['waypoints'][st.session_state.current_waypoint] if data['waypoints'] else None
-                if wp:
-                    st.metric("当前航点", f"{wp['name']} ({st.session_state.current_waypoint + 1}/{len(data['waypoints'])})")
-            else:
-                st.metric("当前航点", "未启动")
+        if st.session_state.is_simulating and data['waypoints']:
+            current_lat, current_lng = st.session_state.current_position
+            target_wp = data['waypoints'][min(st.session_state.current_waypoint, len(data['waypoints'])-1)]
 
-        with col_status2:
-            st.metric("飞行速度", f"{st.session_state.flight_speed} m/s")
+            st.session_state.heading = calculate_heading(
+                current_lat, current_lng, target_wp['lat'], target_wp['lng']
+            )
 
-        if st.session_state.is_simulating:
+            col_status1, col_status2 = st.columns(2)
+
+            with col_status1:
+                wp = data['waypoints'][st.session_state.current_waypoint]
+                st.metric("当前航点", f"{wp['name']} ({st.session_state.current_waypoint + 1}/{len(data['waypoints'])})")
+                st.metric("飞行速度", f"{st.session_state.flight_speed} m/s")
+                st.metric("飞行高度", f"{data.get('uav_altitude', 100)} m")
+
+            with col_status2:
+                heading_dir = get_heading_direction(st.session_state.heading)
+                st.metric("航向", f"{heading_dir} {st.session_state.heading:.1f}°")
+                st.metric("当前坐标", f"{current_lat:.5f}, {current_lng:.5f}")
+
+            st.markdown("---")
+
             elapsed_time = datetime.now() - st.session_state.start_time
             elapsed_str = str(elapsed_time).split('.')[0]
             st.metric("已用时间", elapsed_str)
@@ -543,8 +598,17 @@ def render_flight_monitor_page():
             st.metric("剩余距离", f"{remaining_distance/1000:.2f} km")
             st.metric("预计到达", str(remaining_time).split('.')[0])
 
-            progress = (st.session_state.completed_distance / max(st.session_state.total_distance, 1)) * 100
-            st.progress(progress, text=f"航线进度: {progress:.1f}%")
+            progress = min((st.session_state.completed_distance / max(st.session_state.total_distance, 1)) * 100, 100)
+            st.progress(min(progress / 100, 1.0), text=f"航线进度: {progress:.1f}%")
+        else:
+            col_status1, col_status2 = st.columns(2)
+            with col_status1:
+                st.metric("当前航点", "未启动")
+                st.metric("飞行速度", "-")
+                st.metric("飞行高度", "-")
+            with col_status2:
+                st.metric("航向", "-")
+                st.metric("当前坐标", "-")
 
         st.markdown("---")
 
@@ -630,6 +694,7 @@ def render_flight_monitor_page():
             target_wp = data['waypoints'][st.session_state.current_waypoint]
             current_lat, current_lng = st.session_state.current_position
 
+            # 修复坐标计算错误
             dlat = target_wp['lat'] - current_lat
             dlng = target_wp['lng'] - current_lng
             dist = math.sqrt(dlat**2 + dlng**2) * 111000
@@ -638,6 +703,8 @@ def render_flight_monitor_page():
                 st.session_state.current_waypoint += 1
                 if st.session_state.current_waypoint >= len(data['waypoints']):
                     st.session_state.is_simulating = False
+                    # 确保完成距离等于总距离
+                    st.session_state.completed_distance = st.session_state.total_distance
                     st.success("🎉 已到达终点！")
             else:
                 step = 0.0001
@@ -646,7 +713,11 @@ def render_flight_monitor_page():
                 current_lat += (random.random() - 0.5) * 0.00002
                 current_lng += (random.random() - 0.5) * 0.00002
 
-                st.session_state.completed_distance += 11.1
+                # 限制完成距离不超过总距离
+                st.session_state.completed_distance = min(
+                    st.session_state.completed_distance + 11.1,
+                    st.session_state.total_distance
+                )
 
             st.session_state.current_position = [current_lat, current_lng]
             st.session_state.flight_path.append((current_lat, current_lng))
